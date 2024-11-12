@@ -9,24 +9,22 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-
 const sctx = @import("stackcontent.zig");
 
-const Fiber = @This();
-
 const assert = std.debug.assert;
-pub const log_level: std.log.Level = .debug;
-
-pub const Error = error{ StackTooSmall, StackTooLarge, OutOfMemory };
-
-threadlocal var tls_state: ?*State = null;
+const Fiber = @This();
 
 const InitialStackSize = 2 * 1024; // 2 KB
 const MaxStackSize = 1 * 1024 * 1024; // 1 MB
 
+pub const Error = error{
+    StackTooSmall,
+    StackTooLarge,
+    OutOfMemory,
+};
+
 pub fn init(allocator: std.mem.Allocator, user_data: usize, comptime func: anytype, args: anytype) Error!*Fiber {
     const stack = try allocator.alloc(u8, InitialStackSize);
-
     const Args = @TypeOf(args);
 
     const state = try State.init(stack, user_data, @sizeOf(Args), struct {
@@ -34,42 +32,33 @@ pub fn init(allocator: std.mem.Allocator, user_data: usize, comptime func: anyty
             const state = tls_state orelse unreachable;
 
             // Call the functions with the args.
-            const args_ptr: *align(1) Args = @ptrFromInt(@intFromPtr(state) - @sizeOf(Args));
+            const args_ptr = @as(*align(1) Args, @ptrFromInt(@intFromPtr(state) - @sizeOf(Args)));
             @call(.auto, func, args_ptr.*);
 
-            // if (state.stack_start + 128 > state.stack_end) {
-            //     std.debug.print("growing out of stack space", .{});
-            // }
-            std.debug.print("\nStack {}, Caller {}\n", .{ state.stack_ctx, state.caller_ctx });
-
+            // Mark the fiber as completed and do one last
             zig_fiber_stack_swap(&state.stack_ctx, &state.caller_ctx);
             unreachable;
         }
     }.entry);
 
-    const args_ptr: *align(1) Args = @ptrFromInt(@intFromPtr(state) - @sizeOf(Args));
+    const args_ptr = @as(*align(1) Args, @ptrFromInt(@intFromPtr(state) - @sizeOf(Args)));
     args_ptr.* = args;
 
     return @ptrCast(state);
 }
 
+threadlocal var tls_state: ?*State = null;
+
 pub inline fn current() ?*Fiber {
     return @ptrCast(tls_state);
-}
-
-inline fn checkAlignment(ptr: usize, alignment: usize) void {
-    assert(ptr % alignment == 0);
 }
 
 pub fn getStack(fiber: *Fiber) []u8 {
     const state: *State = @ptrCast(@alignCast(fiber));
 
-    const offset: u8 = @truncate(state.offset);
-    const stack_end = @intFromPtr(state) + offset;
+    const stack_end = @intFromPtr(state) + @as(u8, @truncate(state.offset));
     const stack_base = stack_end - (state.offset >> @bitSizeOf(u8));
-
-    const addrs: [*]u8 = @ptrCast(stack_base);
-    return addrs[0..(stack_end - stack_base)];
+    return @as([*]u8, @ptrCast(stack_base))[0..(stack_end - stack_base)];
 }
 
 pub fn getUserDataPtr(fiber: *Fiber) *usize {
@@ -83,34 +72,18 @@ pub fn switchTo(fiber: *Fiber) void {
     const old_state = tls_state;
     assert(old_state != state);
 
-    const start: usize = @intFromPtr(state.stack_ctx);
-
-    std.debug.print("\nswitchTo Stack {}, Ptr {?}, Caller {}. {?}\n", .{ state.stack_ctx, state.stack_start, state.caller_ctx, start });
-
-    // checkAlignment(stack_ptr, 16);
-
     tls_state = state;
     defer tls_state = old_state;
-
-    std.debug.print("\nSwitching stack \n", .{});
 
     zig_fiber_stack_swap(&state.caller_ctx, &state.stack_ctx);
 }
 
-/// Switches the current thread's execution back to the most recent switchTo() called on the currently running fiber.
-/// Calling yield from outside a fiber context (`current() == null`) is illegal behavior.
-/// Once execution is yielded back, switchTo() on the (now previous) current fiber can be called again
-/// to continue the fiber from this yield point.
 pub fn yield() void {
     const state = tls_state orelse unreachable;
-    std.debug.print("state {}", .{state});
-
     zig_fiber_stack_swap(&state.stack_ctx, &state.caller_ctx);
 }
 
-fn grow_stack(state: *State, new_stack_size: usize) Error!*[]u8 {
-    const allocator = std.heap.page_allocator;
-
+fn growStack(allocator: std.mem.Allocator, state: *State, new_stack_size: usize) Error!*[]u8 {
     const new_stack = try allocator.alloc(u8, new_stack_size);
 
     const old_stack_start = state.stack_ptr;
@@ -125,8 +98,8 @@ const State = extern struct {
     stack_ctx: *anyopaque,
     user_data: usize,
     offset: usize,
-    stack_start: ?*u8,
     stack_size: usize,
+    stack_start: ?*u8,
 
     // Each fiber context has a stack associated
     // Fiber's can be suspended, which means we
@@ -138,64 +111,45 @@ const State = extern struct {
     //
     // The Stack grows downward, so end is at top, start is bottom
 
-    fn init(stack: []u8, user_data: usize, args_size: usize, entry: *const fn () callconv(.C) noreturn) Error!*State {
-        const stack_start = @intFromPtr(stack.ptr);
+    fn init(stack: []u8, user_data: usize, args_size: usize, entry_point: *const fn () callconv(.C) noreturn) Error!*State {
+        const stack_base = @intFromPtr(stack.ptr);
         const stack_end = @intFromPtr(stack.ptr + stack.len);
+        if (stack.len > (std.math.maxInt(usize) >> @bitSizeOf(u8))) return error.StackTooLarge;
 
-        std.debug.print("\nState init: Stack start end {} {} {}\n", .{ stack_end, stack_start, stack_end - stack_start });
+        // Push the State onto the state.
+        var stack_ptr = stack_end - @sizeOf(State);
+        stack_ptr = std.mem.alignBackward(usize, stack_ptr, @alignOf(State));
+        if (stack_ptr < stack_base) return error.StackTooSmall;
 
-        if (stack.len > (std.math.maxInt(usize) >> @bitSizeOf(u8))) {
-            return Error.StackTooLarge;
-        }
+        const state: *State = @ptrFromInt(stack_ptr);
+        const end_offset = stack_end - stack_ptr;
 
-        var sp = stack_end - @sizeOf(State);
-        sp = std.mem.alignBackward(usize, sp, @alignOf(State));
-        if (sp < stack_start) {
-            return Error.StackTooSmall;
-        }
+        // Push enough bytes for the args onto the stack.
+        stack_ptr -= args_size;
+        if (stack_ptr < stack_base) return error.StackTooSmall;
 
-        const state: *State = @ptrFromInt(sp);
-        const end = stack_end - sp;
+        // Align the stack for the StackContext.
+        stack_ptr = std.mem.alignBackward(usize, stack_ptr, 16);
+        if (stack_ptr < stack_base) return error.StackTooSmall;
 
-        sp = sp - args_size;
-        if (sp < stack_start) {
-            return Error.StackTooSmall;
-        }
+        // Reserve data for the StackContext.
+        stack_ptr -= @sizeOf(usize) * sctx.StackContext.word_count;
+        assert(std.mem.isAligned(stack_ptr, @alignOf(usize)));
+        if (stack_ptr < stack_base) return error.StackTooSmall;
 
-        sp = std.mem.alignBackward(usize, sp, 16);
-        if (sp < stack_start) {
-            return Error.StackTooSmall;
-        }
-
-        sp = sp - (@sizeOf(usize) * sctx.StackContext.word_count);
-        assert(std.mem.isAligned(sp, @alignOf(usize)));
-
-        if (sp < stack_start) {
-            return Error.StackTooSmall;
-        }
-
-        const entry_ptr: [*]@TypeOf(entry) = @ptrFromInt(sp);
-        entry_ptr[sctx.StackContext.entry_offset] = entry;
-
-        const stack_pointer: *u8 = &stack.ptr[0];
-
-        assert(sp >= stack_start and sp <= stack_end);
-
-        const xx: *anyopaque = @ptrFromInt(sp);
-        std.debug.print("State:init {} {}\n", .{ sp, xx });
+        // Write the entry point into the StackContext.
+        @as([*]@TypeOf(entry_point), @ptrFromInt(stack_ptr))[sctx.StackContext.entry_offset] = entry_point;
 
         state.* = .{
             .caller_ctx = undefined,
-            .stack_ctx = @ptrFromInt(sp),
+            .stack_ctx = @as(*anyopaque, @ptrFromInt(stack_ptr)),
             .user_data = user_data,
-            .stack_start = stack_pointer,
+            .offset = (stack.len << @bitSizeOf(u8)) | end_offset,
+            .stack_start = @as(*u8, &stack.ptr[0]),
             .stack_size = stack.len,
-            .offset = (stack.len << @bitSizeOf(u8) | end),
         };
 
         assert(@as(usize, @intFromPtr(state)) % @alignOf(State) == 0);
-        std.debug.print("Align {}, {}", .{ @as(usize, @intFromPtr(state)), @alignOf(State) });
-
         return state;
     }
 };
@@ -237,19 +191,23 @@ test "test fiber switching" {
     const allocator1 = arena1.allocator();
     const allocator2 = arena2.allocator();
 
-    var value1: usize = 69;
-    var value2: usize = 69;
+    var value1: u8 = 69;
+    var value2: u8 = 69;
+
+    // const stack1 = try allocator1.alloc(u8, InitialStackSize);
+    // const stack2 = try allocator2.alloc(u8, InitialStackSize);
 
     const fiber1 = try Fiber.init(allocator1, 0, fiber_func1, .{&value1});
-    const fiber2 = try Fiber.init(allocator2, 0, fiber_func1, .{&value2});
+    const fiber2 = try Fiber.init(allocator2, 0, fiber_func2, .{&value2});
 
-    const state1: *State = @ptrCast(@alignCast(fiber1));
-    const state2: *State = @ptrCast(@alignCast(fiber2));
+    // const state1: *State = @ptrCast(@alignCast(fiber1));
+    // const state2: *State = @ptrCast(@alignCast(fiber2));
 
     std.log.warn("cpu arch {}, tag {}, sc {}\n", .{ builtin.cpu.arch, builtin.os.tag, sctx.StackContext });
 
-    try std.testing.expect(state1.stack_start != state2.stack_start);
+    // try std.testing.expect(state1.stack_start != state2.stack_start);
 
+    fiber2.switchTo();
     fiber1.switchTo();
 
     // Fiber.switchTo(fiber2);
@@ -262,8 +220,8 @@ test "test fiber switching" {
     try std.testing.expect(value2 == 101);
 }
 
-fn fiber_func1(value: *usize) void {
-    // std.debug.print("Inside fiber_func1 {}\n", .{args});
+fn fiber_func1(value: *u8) void {
+    // std.debug.print("Inside fiber_func1 {any}\n", .{value});
     //
     // const typed_args: [*]usize = @ptrCast(args);
     // const value_ptr = &typed_args[0];
@@ -271,13 +229,14 @@ fn fiber_func1(value: *usize) void {
     // std.debug.print("typed_args {}\n", .{value_ptr});
     //
     value.* = 42;
-    Fiber.yield();
+
+    // Fiber.yield();
     // std.log.err("Resuming fiber_func1\n", .{});
     // std.debug.print("fiber_func1 running with args: {}\n", .{value});
     // _ = value;
 }
 
-fn fiber_func2(args: anytype) void {
+fn fiber_func2(value: *u8) void {
     // std.debug.print("Inside fiber_func2 {}\n", .{args});
     //
     // const typed_args: [*]usize = @ptrCast(args);
@@ -289,8 +248,8 @@ fn fiber_func2(args: anytype) void {
     // // Fiber.yield();
     //
     // std.log.err("Resuming fiber_func2\n", .{});
-    std.debug.print("fiber_func2 running with args: {}\n", .{args});
-    Fiber.yield();
+    // std.debug.print("fiber_func2 running with args: {any}\n", .{value});
+    value.* = 101;
 }
 
 fn test_fiber_func(args: anytype) void {

@@ -16,15 +16,18 @@ pub fn main() !void {
     var value1: u8 = 69;
     var value2: u8 = 69;
 
-    const fiber1 = try Fiber.init(allocator1, 0, fiber_func1, .{&value1});
-    const fiber2 = try Fiber.init(allocator2, 0, fiber_func1, .{&value2});
+    const stack1 = try allocator1.alloc(u8, 2 * 1024);
+    const stack2 = try allocator2.alloc(u8, 2 * 1024);
+
+    const fiber1 = try Fiber.init(stack1, 0, fiber_func1, .{&value1});
+    const fiber2 = try Fiber.init(stack2, 0, fiber_func1, .{&value2});
 
     // try std.testing.expect(state1.stack_start != state2.stack_start);
     // _ = fiber2;
-    _ = fiber2;
+    // _ = fiber2;
 
+    fiber2.switchTo();
     fiber1.switchTo();
-    Fiber.yield();
 
     // Fiber.switchTo(fiber2);
     // Fiber.switchTo(fiber1);
@@ -45,7 +48,7 @@ fn fiber_func1(value: *u8) void {
     // // Fiber.yield();
     // std.log.err("Resuming fiber_func1\n", .{});
     // std.debug.print("fiber_func1 running with args: {}\n", .{value});
-    // Fiber.yield();
+    Fiber.yield();
     _ = value;
 }
 
