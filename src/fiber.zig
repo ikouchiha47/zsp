@@ -69,6 +69,11 @@ pub fn getUserDataPtr(fiber: *Fiber) *usize {
 pub fn switchTo(fiber: *Fiber) void {
     const state: *State = @ptrCast(@alignCast(fiber));
 
+    if (state.completed) {
+        std.log.warn("Completeed \n", .{});
+        return;
+    }
+
     const old_state = tls_state;
     assert(old_state != state);
 
@@ -81,6 +86,15 @@ pub fn switchTo(fiber: *Fiber) void {
 pub fn yield() void {
     const state = tls_state orelse unreachable;
     zig_fiber_stack_swap(&state.stack_ctx, &state.caller_ctx);
+}
+
+pub fn done() void {
+    if (Fiber.current()) |fiber| {
+        const state: *State = @ptrCast(@alignCast(fiber));
+        state.completed = true;
+    } else {
+        return;
+    }
 }
 
 fn growStack(allocator: std.mem.Allocator, state: *State, new_stack_size: usize) Error!*[]u8 {
@@ -100,6 +114,7 @@ const State = extern struct {
     offset: usize,
     stack_size: usize,
     stack_start: ?*u8,
+    completed: bool,
 
     // Each fiber context has a stack associated
     // Fiber's can be suspended, which means we
@@ -147,6 +162,7 @@ const State = extern struct {
             .offset = (stack.len << @bitSizeOf(u8)) | end_offset,
             .stack_start = @as(*u8, &stack.ptr[0]),
             .stack_size = stack.len,
+            .completed = false,
         };
 
         assert(@as(usize, @intFromPtr(state)) % @alignOf(State) == 0);
@@ -210,30 +226,21 @@ test "test fiber switching" {
     fiber2.switchTo();
     fiber1.switchTo();
 
-    // Fiber.switchTo(fiber2);
-    // Fiber.switchTo(fiber1);
-
-    // try std.testing.expect(state1.stack_start != null);
-    // try std.testing.expect(state2.stack_start != null);
-    //
     try std.testing.expect(value1 == 42);
     try std.testing.expect(value2 == 101);
+
+    fiber1.switchTo();
+    try std.testing.expect(value1 == 65);
+
+    fiber1.switchTo();
 }
 
 fn fiber_func1(value: *u8) void {
-    // std.debug.print("Inside fiber_func1 {any}\n", .{value});
-    //
-    // const typed_args: [*]usize = @ptrCast(args);
-    // const value_ptr = &typed_args[0];
-    //
-    // std.debug.print("typed_args {}\n", .{value_ptr});
-    //
     value.* = 42;
+    Fiber.yield();
 
-    // Fiber.yield();
-    // std.log.err("Resuming fiber_func1\n", .{});
-    // std.debug.print("fiber_func1 running with args: {}\n", .{value});
-    // _ = value;
+    value.* = value.* + 23;
+    Fiber.done();
 }
 
 fn fiber_func2(value: *u8) void {
@@ -242,14 +249,8 @@ fn fiber_func2(value: *u8) void {
     // const typed_args: [*]usize = @ptrCast(args);
     // const value_ptr = typed_args[0];
     //
-    // std.debug.print("typed_args {}\n", .{value_ptr});
-    //
-    // // value_ptr = 102;
-    // // Fiber.yield();
-    //
-    // std.log.err("Resuming fiber_func2\n", .{});
-    // std.debug.print("fiber_func2 running with args: {any}\n", .{value});
     value.* = 101;
+    Fiber.done();
 }
 
 fn test_fiber_func(args: anytype) void {
