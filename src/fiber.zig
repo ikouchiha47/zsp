@@ -53,6 +53,11 @@ pub inline fn current() ?*Fiber {
     return @ptrCast(tls_state);
 }
 
+pub fn isDone(fiber: *Fiber) bool {
+    const state: *State = @ptrCast(@alignCast(fiber));
+    return state.completed;
+}
+
 pub fn getStack(fiber: *Fiber) []u8 {
     const state: *State = @ptrCast(@alignCast(fiber));
 
@@ -210,18 +215,13 @@ test "test fiber switching" {
     var value1: u8 = 69;
     var value2: u8 = 69;
 
-    // const stack1 = try allocator1.alloc(u8, InitialStackSize);
-    // const stack2 = try allocator2.alloc(u8, InitialStackSize);
-
     const fiber1 = try Fiber.init(allocator1, 0, fiber_func1, .{&value1});
     const fiber2 = try Fiber.init(allocator2, 0, fiber_func2, .{&value2});
 
-    // const state1: *State = @ptrCast(@alignCast(fiber1));
-    // const state2: *State = @ptrCast(@alignCast(fiber2));
-
     std.log.warn("cpu arch {}, tag {}, sc {}\n", .{ builtin.cpu.arch, builtin.os.tag, sctx.StackContext });
 
-    // try std.testing.expect(state1.stack_start != state2.stack_start);
+    try std.testing.expect(fiber1.isDone() == false);
+    try std.testing.expect(fiber2.isDone() == false);
 
     fiber2.switchTo();
     fiber1.switchTo();
@@ -229,9 +229,11 @@ test "test fiber switching" {
     try std.testing.expect(value1 == 42);
     try std.testing.expect(value2 == 101);
 
+    try std.testing.expect(fiber1.isDone() == false);
     fiber1.switchTo();
     try std.testing.expect(value1 == 65);
 
+    try std.testing.expect(fiber1.isDone() == true);
     fiber1.switchTo();
 }
 
