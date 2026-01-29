@@ -449,6 +449,136 @@ const Sched = struct {
 
 ---
 
+## GoBuf (Context Save/Restore)
+
+**Go**: [runtime2.go#L303-L322](https://github.com/golang/go/blob/master/src/runtime/runtime2.go#L303-L322)
+
+```go
+type gobuf struct {
+    sp   uintptr        // stack pointer
+    pc   uintptr        // program counter
+    g    guintptr       // back pointer to G
+    ctxt unsafe.Pointer // closure context
+    lr   uintptr        // link register (ARM)
+    bp   uintptr        // base pointer (x86)
+}
+```
+
+This is the minimal state needed to suspend and resume a goroutine.
+
+---
+
+## sysmon (System Monitor)
+
+**Go**: [proc.go#L6486-L6620](https://github.com/golang/go/blob/master/src/runtime/proc.go#L6486-L6620)
+
+Dedicated goroutine that runs without a P, handling:
+
+1. **Network polling** - if not polled for >10ms
+2. **Retake P's** - from G's stuck in syscalls
+3. **Preemption** - of long-running G's (>10ms)
+4. **GC triggering** - force GC if needed
+5. **Scavenger wake** - return memory to OS
+
+```go
+func sysmon() {
+    idle := 0
+    delay := uint32(20) // start with 20µs
+
+    for {
+        usleep(delay)
+
+        // Adaptive sleep: 20µs → 10ms based on idle cycles
+        if idle > 50 {
+            delay *= 2
+        }
+        if delay > 10*1000 {
+            delay = 10 * 1000
+        }
+
+        // Poll network if stale
+        if lastpoll+10ms < now {
+            netpoll(0)
+        }
+
+        // Retake P's and preempt long-running G's
+        if retake(now) != 0 {
+            idle = 0
+        } else {
+            idle++
+        }
+
+        // Force GC if needed
+        if gcTrigger.test() {
+            forcegc()
+        }
+    }
+}
+```
+
+---
+
+## retake() - P Recovery
+
+**Go**: [proc.go#L6630-L6730](https://github.com/golang/go/blob/master/src/runtime/proc.go#L6630-L6730)
+
+Called by sysmon to reclaim P's from:
+- G's running too long (>10ms) → preempt
+- G's stuck in syscall (>10-20ms) → steal P
+
+```go
+func retake(now int64) uint32 {
+    for _, pp := range allp {
+        if pp.status != _Prunning {
+            continue
+        }
+
+        // Preempt if running too long (10ms)
+        if pd.schedwhen+forcePreemptNS <= now {
+            preemptone(pp)
+        }
+
+        // Retake P if in syscall too long
+        if pd.syscallwhen+10ms <= now {
+            handoffp(pp)  // give P to another M
+        }
+    }
+}
+```
+
+Key constant: `forcePreemptNS = 10ms`
+
+---
+
+## preemptone() - Cooperative Preemption
+
+**Go**: [proc.go#L6866-L6895](https://github.com/golang/go/blob/master/src/runtime/proc.go#L6866-L6895)
+
+```go
+func preemptone(pp *p) bool {
+    gp := pp.m.ptr().curg
+
+    // Set preemption flag
+    gp.preempt = true
+
+    // Trick: set stackguard0 to trigger "stack overflow"
+    // Next function call will check and yield
+    gp.stackguard0 = stackPreempt
+
+    // Async preemption via signal (Go 1.14+)
+    if preemptMSupported {
+        pp.preempt = true
+        preemptM(mp)  // send signal to thread
+    }
+
+    return true
+}
+```
+
+**Two mechanisms:**
+1. **Cooperative** - stackguard0 trick, checked at function entry
+2. **Async** (Go 1.14+) - SIGURG signal to thread, can preempt tight loops
+
 ---
 
 ## Acceptance Criteria (Zig Pseudocode)
@@ -945,9 +1075,1309 @@ test "global queue fairness" {
 
 ---
 
+# Pony Actor Model Comparison
+
+## Source Files
+
+| File | Description | Link |
+|------|-------------|------|
+| `scheduler.h` | Scheduler + context definitions | [scheduler.h](https://github.com/ponylang/ponyc/blob/main/src/libponyrt/sched/scheduler.h) |
+| `scheduler.c` | Work stealing scheduler | [scheduler.c](https://github.com/ponylang/ponyc/blob/main/src/libponyrt/sched/scheduler.c) |
+| `actor.h` | Actor structure | [actor.h](https://github.com/ponylang/ponyc/blob/main/src/libponyrt/actor/actor.h) |
+| `mpmcq.h/c` | Multi-producer multi-consumer queue | [mpmcq.h](https://github.com/ponylang/ponyc/blob/main/src/libponyrt/sched/mpmcq.h) |
+
+---
+
+## Actor vs Goroutine vs Thread
+
+| Aspect | Thread | Goroutine (Go) | Actor (Pony) |
+|--------|--------|----------------|--------------|
+| **Memory** | ~1MB stack | ~2KB (growable) | ~256 bytes |
+| **Creation** | OS syscall | Runtime alloc | Runtime alloc |
+| **Communication** | Shared memory + locks | Channels | Message passing |
+| **State** | Shared (needs sync) | Shared (needs sync) | **Isolated** (no sharing) |
+| **Scheduling** | OS preemptive | Runtime M:N:P | Runtime work-stealing |
+| **Safety** | Manual | Runtime checks | **Type system (caps)** |
+
+---
+
+## Pony Actor Structure
+
+[actor.h#L83-L100](https://github.com/ponylang/ponyc/blob/main/src/libponyrt/actor/actor.h#L83-L100)
+
+```c
+typedef struct pony_actor_t
+{
+  pony_type_t* type;
+  messageq_t q;           // per-actor message queue
+  PONY_ATOMIC(uint8_t) sync_flags;
+
+  // Separate cache line for local access
+  alignas(64) heap_t heap; // per-actor heap!
+  size_t muted;
+  uint8_t internal_flags;
+  gc_t gc;                 // per-actor GC state
+} pony_actor_t;
+```
+
+**Key insight**: Each actor has its own **heap** and **GC**. No global stop-the-world!
+
+---
+
+## Pony Scheduler Structure
+
+[scheduler.h#L101-L125](https://github.com/ponylang/ponyc/blob/main/src/libponyrt/sched/scheduler.h#L101-L125)
+
+```c
+struct scheduler_t
+{
+  pony_thread_id_t tid;
+  int32_t index;
+  bool terminate;
+
+  // Per-scheduler context
+  pony_ctx_t ctx;
+
+  // Work stealing target
+  alignas(64) struct scheduler_t* last_victim;
+
+  // Local queue (MPMC for stealing)
+  mpmcq_t q;
+
+  // Internal message queue
+  messageq_t mq;
+};
+```
+
+---
+
+## Pony's Work Stealing
+
+[scheduler.c#L909-L1030](https://github.com/ponylang/ponyc/blob/main/src/libponyrt/sched/scheduler.c#L909-L1030)
+
+```c
+static pony_actor_t* steal(scheduler_t* sched)
+{
+  uint32_t steal_attempts = 0;
+  uint64_t tsc = ponyint_cpu_tick();
+
+  while(true)
+  {
+    // 1. Choose victim (round-robin from last_victim)
+    scheduler_t* victim = choose_victim(sched);
+
+    // 2. Try global queue first, then victim's queue
+    pony_actor_t* actor = pop_global(victim);
+    if(actor != NULL)
+      return actor;
+
+    // 3. Check for messages (unmuted actors)
+    if(read_msg(sched, actor)) {
+      actor = pop_global(sched);
+      if(actor != NULL)
+        return actor;
+    }
+
+    // 4. Check quiescence (all done?)
+    if(quiescent(sched, tsc, tsc2))
+      return NULL;
+
+    // 5. After N attempts + threshold, consider blocking
+    if (steal_attempts >= active_scheduler_count &&
+        clocks_elapsed > PONY_SCHED_BLOCK_THRESHOLD) {
+      send_msg(SCHED_BLOCK);
+
+      // Try to suspend this scheduler
+      actor = perhaps_suspend_scheduler(sched);
+      if (actor != NULL)
+        return actor;
+    }
+
+    steal_attempts++;
+  }
+}
+```
+
+**Key differences from Go:**
+- Steals **one actor** at a time (not half the queue)
+- Uses **MPMC queue** (Go uses lock-free SPMC)
+- **Adaptive scheduler count** - suspends idle schedulers
+- **Block/unblock protocol** for termination detection
+
+---
+
+## Behaviours (Async Methods)
+
+In Pony, actors receive messages via **behaviours**:
+
+```pony
+actor Counter
+  var _count: U64 = 0
+
+  // Behaviour: async, returns immediately
+  be increment() =>
+    _count = _count + 1
+
+  // Behaviour: async message passing
+  be get_count(main: Main) =>
+    main.receive_count(_count)
+```
+
+This is fundamentally different from Go's channels:
+
+| Pony Behaviours | Go Channels |
+|-----------------|-------------|
+| Method call syntax | Explicit send/receive |
+| One receiver (the actor) | Multiple receivers possible |
+| Always async | Can be sync (unbuffered) |
+| No blocking | Can block sender/receiver |
+
+---
+
+## Reference Capabilities (Pony's Secret Sauce)
+
+Pony guarantees data-race freedom at **compile time** via reference capabilities:
+
+| Capability | Alias? | Read? | Write? | Use Case |
+|------------|--------|-------|--------|----------|
+| `iso` | No | Yes | Yes | Transfer ownership |
+| `val` | Yes | Yes | No | Immutable shared data |
+| `ref` | No | Yes | Yes | Mutable, single owner |
+| `box` | Yes | Yes | No | Read-only alias |
+| `tag` | Yes | No | No | Identity only |
+| `trn` | No | Yes | Yes | Transition to `val` |
+
+**Rule**: You can only **send** `iso`, `val`, or `tag` between actors.
+
+This eliminates the need for:
+- Locks
+- Atomic operations for data
+- Runtime race detection
+
+---
+
+## Comparison: Go M:N:P vs Pony Actors
+
+| Aspect | Go M:N:P | Pony Actors |
+|--------|----------|-------------|
+| **Unit of work** | G (goroutine) | Actor |
+| **Scheduling entity** | P (processor context) | Scheduler thread |
+| **Work queue** | Per-P local + global | Per-scheduler + global inject |
+| **Stealing** | Half of victim's queue | One actor at a time |
+| **Preemption** | Yes (signal + stackguard) | No (run to completion) |
+| **GC** | Global STW | Per-actor (no STW!) |
+| **Memory model** | Shared memory + sync | Isolated heaps + messages |
+| **Safety** | Runtime (race detector) | Compile time (caps) |
+
+---
+
+## Acceptance Criteria: Pony-style Actor (Zig)
+
+### AC-P1: Actor Structure
+
+```zig
+const Actor = struct {
+    type_info: *const TypeInfo,
+
+    // Per-actor message queue (MPSC)
+    mailbox: MessageQueue,
+
+    // Per-actor heap (no shared GC!)
+    heap: Heap,
+
+    // Actor state
+    flags: Flags,
+
+    // Muting for backpressure
+    muted: usize,
+
+    const Flags = packed struct {
+        blocked: bool = false,
+        unscheduled: bool = false,
+        pending_destroy: bool = false,
+        overloaded: bool = false,
+        muted: bool = false,
+    };
+};
+```
+
+### AC-P2: Message Structure
+
+```zig
+const Message = struct {
+    // Message type ID
+    id: u32,
+
+    // Intrusive linked list
+    next: ?*Message,
+
+    // Payload follows (variable size)
+
+    fn payload(self: *Message, comptime T: type) *T {
+        return @ptrCast(@alignCast(@as([*]u8, @ptrCast(self)) + @sizeOf(Message)));
+    }
+};
+
+const MessageQueue = struct {
+    head: Atomic(?*Message),
+    tail: *Atomic(?*Message),  // points to last node's next field
+
+    // MPSC: multiple producers, single consumer
+    fn push(self: *MessageQueue, msg: *Message) void { ... }
+    fn pop(self: *MessageQueue) ?*Message { ... }
+};
+```
+
+### AC-P3: Scheduler with Actor Stealing
+
+```zig
+const Scheduler = struct {
+    tid: std.Thread.Id,
+    index: u32,
+
+    // Context for current execution
+    ctx: Context,
+
+    // Local work queue (MPMC for stealing)
+    queue: MPMCQueue(*Actor),
+
+    // Last victim for locality
+    last_victim: ?*Scheduler,
+
+    // Stats
+    steal_attempts: u32,
+};
+
+const Context = struct {
+    scheduler: *Scheduler,
+    current: ?*Actor,  // actor being executed
+};
+
+// Global state
+var schedulers: []Scheduler = undefined;
+var inject_queue: MPMCQueue(*Actor) = .{};  // global inject
+var active_count: Atomic(u32) = .{ .value = 0 };
+```
+
+### AC-P4: Actor Execution Loop
+
+```zig
+fn run(sched: *Scheduler) void {
+    while (!sched.terminate) {
+        // 1. Get actor from local queue
+        var actor = sched.queue.pop();
+
+        // 2. If empty, try global inject
+        if (actor == null) {
+            actor = inject_queue.pop();
+        }
+
+        // 3. If still empty, steal
+        if (actor == null) {
+            actor = steal(sched);
+        }
+
+        // 4. If nothing, maybe suspend
+        if (actor == null) {
+            maybeSuspend(sched);
+            continue;
+        }
+
+        // 5. Run the actor (process messages)
+        runActor(sched, actor.?);
+    }
+}
+
+fn runActor(sched: *Scheduler, actor: *Actor) void {
+    sched.ctx.current = actor;
+    defer sched.ctx.current = null;
+
+    // Process messages until empty or batch limit
+    var batch: u32 = 0;
+    while (actor.mailbox.pop()) |msg| {
+        // Dispatch to behaviour handler
+        actor.type_info.dispatch(actor, msg);
+
+        batch += 1;
+        if (batch >= MAX_BATCH) break;
+    }
+
+    // Reschedule if more messages
+    if (!actor.mailbox.empty()) {
+        sched.queue.push(actor);
+    }
+}
+```
+
+### AC-P5: Work Stealing (Pony-style)
+
+```zig
+fn steal(sched: *Scheduler) ?*Actor {
+    const start_tsc = rdtsc();
+    var attempts: u32 = 0;
+
+    while (true) {
+        // Choose victim (round-robin from last_victim)
+        const victim = chooseVictim(sched);
+        sched.last_victim = victim;
+
+        // Try victim's queue
+        if (victim.queue.pop()) |actor| {
+            return actor;
+        }
+
+        // Try global inject
+        if (inject_queue.pop()) |actor| {
+            return actor;
+        }
+
+        // Check elapsed time
+        const elapsed = rdtsc() - start_tsc;
+        attempts += 1;
+
+        // After trying all schedulers + threshold, consider blocking
+        if (attempts >= active_count.load(.acquire) and
+            elapsed > BLOCK_THRESHOLD) {
+
+            if (maybeSuspend(sched)) {
+                return null;  // suspended, will be woken later
+            }
+        }
+
+        // Yield to avoid spinning
+        std.Thread.yield();
+    }
+}
+
+fn chooseVictim(sched: *Scheduler) *Scheduler {
+    // Start from last victim for cache locality
+    var idx = if (sched.last_victim) |v| v.index else 0;
+
+    for (0..schedulers.len) |_| {
+        idx = (idx + 1) % @intCast(schedulers.len);
+        if (idx != sched.index) {
+            return &schedulers[idx];
+        }
+    }
+
+    return &schedulers[0];
+}
+```
+
+### AC-P6: Backpressure (Muting)
+
+```zig
+fn send(sender: *Actor, receiver: *Actor, msg: *Message) void {
+    receiver.mailbox.push(msg);
+
+    // Check if receiver is overloaded
+    if (receiver.flags.overloaded) {
+        // Mute the sender (stop it from sending more)
+        sender.muted += 1;
+        receiver.muted_senders.push(sender);
+    }
+
+    // Schedule receiver if not already scheduled
+    if (receiver.flags.unscheduled) {
+        receiver.flags.unscheduled = false;
+        scheduleActor(receiver);
+    }
+}
+
+fn unmuteSenders(actor: *Actor) void {
+    while (actor.muted_senders.pop()) |sender| {
+        sender.muted -= 1;
+        if (sender.muted == 0) {
+            // Sender can run again
+            scheduleActor(sender);
+        }
+    }
+}
+```
+
+---
+
+## Hybrid Approach: Best of Both?
+
+For runtime.zig, consider a hybrid:
+
+| Feature | From Go | From Pony |
+|---------|---------|-----------|
+| M:N:P structure | ✓ P contexts | |
+| Work stealing | ✓ Steal half | |
+| Preemption | ✓ Signal-based | |
+| Per-actor heap | | ✓ No global GC pause |
+| Message queues | | ✓ MPSC per actor |
+| Backpressure | | ✓ Muting |
+| Run-to-completion | | ✓ For short tasks |
+
+---
+
+# Erlang/BEAM Comparison
+
+## Source Files & References
+
+| Resource | Description | Link |
+|----------|-------------|------|
+| The BEAM Book | Deep dive into Erlang runtime | [theBeamBook](http://blog.stenmans.org/theBeamBook/) |
+| BEAM Scheduling | Scheduling chapter | [scheduling.asciidoc](https://github.com/happi/theBeamBook/blob/master/chapters/scheduling.asciidoc) |
+| Erlang Processes | Efficiency guide | [Erlang Docs](https://www.erlang.org/docs/22/efficiency_guide/processes) |
+| Erlang Scheduler Deep Dive | 2024 article | [AppSignal Blog](https://blog.appsignal.com/2024/04/23/deep-diving-into-the-erlang-scheduler.html) |
+
+---
+
+## Erlang vs Pony vs Go
+
+| Aspect | Erlang/BEAM | Pony | Go |
+|--------|-------------|------|-----|
+| **Typing** | Dynamic | Static + Caps | Static |
+| **Execution** | Interpreted (BEAM) | Compiled (native) | Compiled (native) |
+| **Unit** | Process | Actor | Goroutine |
+| **Memory** | Per-process heap | Per-actor heap | Shared heap |
+| **GC** | Per-process copying | Per-actor (ORCA) | Global STW |
+| **Scheduling** | Preemptive (reductions) | Run-to-completion | Preemptive (signals) |
+| **Hot reload** | Yes! | No | No |
+| **Fault tolerance** | Supervisors, "let it crash" | Limited | Manual |
+
+---
+
+## Erlang Process Model
+
+Each Erlang process has:
+- **Own heap** - starts at 233 words, grows/shrinks as needed
+- **Own stack** - no fixed size limits
+- **Own GC** - no global stop-the-world!
+- **Mailbox** - message queue
+
+```erlang
+% Spawn a new process
+Pid = spawn(fun() -> loop(0) end),
+
+% Send a message
+Pid ! {increment, 5},
+
+% Receive (blocks)
+receive
+    {result, Value} -> Value
+end.
+```
+
+---
+
+## BEAM Scheduler Architecture
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                    BEAM VM                              │
+├─────────────┬─────────────┬─────────────┬──────────────┤
+│ Scheduler 1 │ Scheduler 2 │ Scheduler 3 │ Scheduler N  │
+│   (core 0)  │   (core 1)  │   (core 2)  │   (core N)   │
+├─────────────┼─────────────┼─────────────┼──────────────┤
+│  Run Queue  │  Run Queue  │  Run Queue  │  Run Queue   │
+│    ├─P1     │    ├─P4     │    ├─P7     │    ├─P10     │
+│    ├─P2     │    ├─P5     │    ├─P8     │    ├─P11     │
+│    └─P3     │    └─P6     │    └─P9     │    └─P12     │
+└─────────────┴─────────────┴─────────────┴──────────────┘
+```
+
+**Key features:**
+- One scheduler thread per CPU core (typically)
+- Each scheduler has its own run queue
+- Work stealing between schedulers
+- Process migration for load balancing
+
+---
+
+## Reductions: Preemptive Scheduling
+
+Erlang uses **reductions** for preemption - a counter that decrements with each operation:
+
+| Operation | Reductions |
+|-----------|------------|
+| Function call | 1 |
+| BIF (built-in function) | 1-many |
+| Message send | ~8 |
+| GC | varies |
+
+**Default reduction limit**: ~4000 reductions per process before preemption
+
+```erlang
+% Process runs until:
+% 1. Reduction count exhausted (preempted)
+% 2. Waiting for message (yield)
+% 3. Process exits
+```
+
+This is different from Go (signal-based) and Pony (run-to-completion).
+
+---
+
+## Erlang GC: Per-Process Generational
+
+```
+Process Heap (per-process):
+┌─────────────────────────────────────┐
+│         Young Generation            │
+│  (frequently collected, short-lived)│
+├─────────────────────────────────────┤
+│          Old Generation             │
+│ (infrequently collected, long-lived)│
+└─────────────────────────────────────┘
+
+Shared Binary Heap (global):
+┌─────────────────────────────────────┐
+│  Large binaries (>64 bytes)         │
+│  Reference counted                  │
+└─────────────────────────────────────┘
+```
+
+**GC characteristics:**
+- Generational semi-space copying (Cheney's algorithm)
+- Young gen: collected frequently
+- Old gen: collected rarely (survived multiple GCs)
+- No global STW! Only affects the running process
+- Large binaries shared (reference counted)
+
+---
+
+## Message Passing: Copy vs Reference
+
+| Data Type | Erlang | Pony | Go |
+|-----------|--------|------|-----|
+| Small data | **Copy** to receiver heap | Copy (via caps) | Pointer (shared) |
+| Large binary | **Reference** (shared) | Copy or `iso` transfer | Pointer (shared) |
+| Mutable | N/A (immutable!) | `iso` transfer | Mutex/channel |
+
+Erlang's model is simpler because **everything is immutable** - copying is always safe.
+
+---
+
+## Fault Tolerance: Supervisors
+
+Erlang's "let it crash" philosophy:
+
+```erlang
+% Supervisor tree
+-module(my_sup).
+-behaviour(supervisor).
+
+init([]) ->
+    {ok, {{one_for_one, 5, 10},  % restart strategy
+          [{worker1, {my_worker, start_link, []},
+            permanent, 5000, worker, [my_worker]}]}}.
+
+% If worker crashes, supervisor restarts it
+% "one_for_one": only restart the crashed child
+% "one_for_all": restart all children
+% "rest_for_one": restart crashed + children started after it
+```
+
+Neither Go nor Pony have built-in supervisor trees.
+
+---
+
+## Comparison: Scheduling Strategies
+
+### Erlang: Reduction-Based Preemption
+
+```
+Process A runs → 4000 reductions → PREEMPT → Process B runs
+                                     ↑
+                               Scheduler decides
+```
+
+**Pros**: Fair, predictable, no infinite loops
+**Cons**: Reduction counting overhead
+
+### Pony: Run-to-Completion
+
+```
+Actor A runs → processes ALL messages (or batch) → yields → Actor B runs
+                          ↑
+                    Actor decides when done
+```
+
+**Pros**: No preemption overhead, better cache locality
+**Cons**: Long-running behaviour can starve others
+
+### Go: Signal-Based Preemption
+
+```
+G runs → 10ms timeout → SIGURG → G preempted → another G runs
+                           ↑
+                      sysmon sends signal
+```
+
+**Pros**: True preemption, handles tight loops
+**Cons**: Signal handling complexity, platform-specific
+
+---
+
+## Acceptance Criteria: Erlang-style Features (Zig)
+
+### AC-E1: Reduction-Based Scheduling
+
+```zig
+const Process = struct {
+    // ...existing fields...
+    reductions: u32 = 0,
+
+    const REDUCTION_LIMIT = 4000;
+
+    fn executeReduction(self: *Process) void {
+        self.reductions += 1;
+    }
+
+    fn shouldYield(self: *Process) bool {
+        return self.reductions >= REDUCTION_LIMIT;
+    }
+
+    fn resetReductions(self: *Process) void {
+        self.reductions = 0;
+    }
+};
+
+fn runProcess(sched: *Scheduler, proc: *Process) void {
+    proc.resetReductions();
+
+    while (proc.mailbox.pop()) |msg| {
+        proc.dispatch(msg);
+
+        // Check reduction count
+        if (proc.shouldYield()) {
+            // Reschedule, let others run
+            sched.queue.push(proc);
+            return;
+        }
+    }
+}
+```
+
+### AC-E2: Per-Process Heap
+
+```zig
+const Process = struct {
+    // Per-process heap (like Erlang)
+    heap: ProcessHeap,
+
+    // Per-process GC state
+    gc: ProcessGC,
+
+    const ProcessHeap = struct {
+        young: []u8,      // young generation
+        old: []u8,        // old generation
+        young_ptr: usize, // allocation pointer
+        old_ptr: usize,
+
+        fn alloc(self: *ProcessHeap, size: usize) ?*anyopaque {
+            // Allocate from young generation
+            if (self.young_ptr + size <= self.young.len) {
+                const ptr = self.young.ptr + self.young_ptr;
+                self.young_ptr += size;
+                return @ptrCast(ptr);
+            }
+            // Need GC
+            return null;
+        }
+    };
+
+    const ProcessGC = struct {
+        generation: u8 = 0,
+        collections: u32 = 0,
+
+        fn collect(self: *ProcessGC, heap: *ProcessHeap) void {
+            // Cheney's copying collection
+            // Copy live data from young to new young (or old if survived)
+            self.collections += 1;
+        }
+    };
+};
+```
+
+### AC-E3: Shared Binary Heap
+
+```zig
+// Global shared heap for large binaries (like Erlang's refc binaries)
+const SharedBinaryHeap = struct {
+    lock: std.Thread.Mutex = .{},
+    binaries: std.ArrayList(RefCountedBinary),
+
+    const RefCountedBinary = struct {
+        data: []u8,
+        refcount: Atomic(u32),
+
+        fn retain(self: *RefCountedBinary) void {
+            _ = self.refcount.fetchAdd(1, .acq_rel);
+        }
+
+        fn release(self: *RefCountedBinary, heap: *SharedBinaryHeap) void {
+            if (self.refcount.fetchSub(1, .acq_rel) == 1) {
+                heap.free(self);
+            }
+        }
+    };
+};
+
+// Threshold for shared vs copied
+const BINARY_SHARE_THRESHOLD = 64;
+
+fn sendBinary(sender: *Process, receiver: *Process, data: []const u8) void {
+    if (data.len > BINARY_SHARE_THRESHOLD) {
+        // Share via reference
+        const shared = shared_heap.alloc(data);
+        shared.retain(); // receiver's reference
+        receiver.mailbox.push(.{ .shared_binary = shared });
+    } else {
+        // Copy to receiver's heap
+        const copy = receiver.heap.alloc(data.len);
+        @memcpy(copy, data);
+        receiver.mailbox.push(.{ .binary = copy });
+    }
+}
+```
+
+### AC-E4: Supervisor Tree (Optional)
+
+```zig
+const Supervisor = struct {
+    strategy: Strategy,
+    max_restarts: u32,
+    max_time: u64,  // in ms
+    children: []ChildSpec,
+    restart_history: RingBuffer(u64),
+
+    const Strategy = enum {
+        one_for_one,   // restart only crashed child
+        one_for_all,   // restart all children
+        rest_for_one,  // restart crashed + later children
+    };
+
+    const ChildSpec = struct {
+        id: []const u8,
+        start_fn: *const fn () *Process,
+        restart: RestartType,
+        process: ?*Process,
+    };
+
+    const RestartType = enum {
+        permanent,  // always restart
+        temporary,  // never restart
+        transient,  // restart only if abnormal exit
+    };
+
+    fn handleChildExit(self: *Supervisor, child: *ChildSpec, reason: ExitReason) void {
+        // Check restart limits
+        const now = std.time.milliTimestamp();
+        self.restart_history.push(now);
+
+        if (self.tooManyRestarts()) {
+            // Supervisor itself should crash
+            @panic("supervisor max restarts exceeded");
+        }
+
+        switch (self.strategy) {
+            .one_for_one => self.restartChild(child),
+            .one_for_all => self.restartAllChildren(),
+            .rest_for_one => self.restartChildrenAfter(child),
+        }
+    }
+};
+```
+
+---
+
+## Summary: Three Models
+
+| Feature | Erlang | Pony | Go |
+|---------|--------|------|-----|
+| **Best for** | Fault-tolerant systems, telecom | High-performance, data races impossible | General purpose, simple concurrency |
+| **Preemption** | Reductions (~4000) | None (run-to-completion) | Signals (~10ms) |
+| **GC** | Per-process, no global pause | Per-actor (ORCA) | Global STW |
+| **Memory** | Copy everything (immutable) | Caps control aliasing | Shared + sync |
+| **Fault handling** | Supervisors, "let it crash" | Manual | Manual |
+| **Hot code reload** | Yes | No | No |
+
+---
+
+# Zig Implementation Reality Check
+
+## Native Code Constraints
+
+Zig compiles to native machine code via LLVM. No VM, no bytecode, no interpreter.
+
+| Feature | Erlang (BEAM) | Go | Pony | Zig |
+|---------|---------------|-----|------|-----|
+| Execution | Bytecode interpreter | Native | Native | Native |
+| Hot reload | ✅ Yes | ❌ No | ❌ No | ❌ No |
+| Reduction preemption | ✅ Yes | ❌ No | ❌ No | ❌ No |
+| Signal preemption | N/A | ✅ Yes | ❌ No | ✅ Yes |
+| Compiler-inserted checks | ✅ Yes | ✅ Yes | ❌ No | ❌ No |
+
+---
+
+## Why Hot Reload is Impossible
+
+```
+Erlang:
+  Code → Bytecode → BEAM VM loads/swaps modules at runtime
+                    ↓
+  Functions referenced by name in module table
+                    ↓
+  Can swap module while processes run
+
+Zig/Go/Pony:
+  Code → LLVM → Native machine code
+                    ↓
+  Functions are memory addresses baked into binary
+                    ↓
+  No indirection layer to swap
+```
+
+**Workarounds (all have drawbacks):**
+- `dlopen`/`dlsym` - complex state management
+- Recompile + restart - loses in-flight state
+- Build interpreter in Zig - defeats purpose
+
+---
+
+## Why Reduction Preemption is Impossible
+
+Erlang's compiler inserts reduction checks everywhere:
+
+```erlang
+% Erlang compiler transforms this:
+my_function(X) -> do_work(X).
+
+% Into something like:
+my_function(X) ->
+    decrement_reductions(),      % ← compiler inserted
+    check_should_yield(),        % ← compiler inserted
+    do_work(X).
+```
+
+In Zig, we don't control the compiler. We can't inject checks at:
+- Every function entry
+- Every loop back-edge
+- Every BIF call
+
+**Go cheats** by controlling its own compiler - inserts `stackguard0` checks.
+
+---
+
+## What Zig CAN Do
+
+### 1. Signal-Based Preemption (like Go 1.14+)
+
+```zig
+const SignalPreemption = struct {
+    /// sysmon calls this for stuck G's
+    pub fn preemptM(m: *M) void {
+        // Send SIGURG to M's OS thread
+        _ = std.os.linux.tgkill(
+            std.os.linux.getpid(),
+            m.tid,
+            std.os.SIG.URG
+        );
+    }
+
+    /// Runs on M's thread when signal received
+    pub fn handler(
+        _: i32,
+        _: *std.os.siginfo_t,
+        ctx_ptr: ?*anyopaque
+    ) callconv(.C) void {
+        const ctx: *std.os.ucontext_t = @ptrCast(@alignCast(ctx_ptr));
+        const g = tls_current_g orelse return;
+
+        // Save CPU registers from signal context
+        g.saved_regs = SavedRegs.fromContext(ctx);
+        g.status = .preempted;
+
+        // Redirect execution to scheduler
+        ctx.uc_mcontext.gregs[std.os.REG.RIP] = @intFromPtr(&schedule);
+    }
+
+    pub fn install() void {
+        var sa = std.os.Sigaction{
+            .handler = .{ .sigaction = handler },
+            .mask = std.os.empty_sigset,
+            .flags = std.os.SA.SIGINFO,
+        };
+        std.os.sigaction(std.os.SIG.URG, &sa, null);
+    }
+};
+```
+
+**Pros:** True preemption, handles infinite loops
+**Cons:** Platform-specific, signal safety complexity, only works at interruptible points
+
+### 2. Cooperative Preemption (flag checks)
+
+```zig
+/// G checks this at known safe points
+pub fn checkPreempt() void {
+    const g = getCurrentG() orelse return;
+    if (g.preempt.load(.acquire)) {
+        g.preempt.store(false, .release);
+        yieldToScheduler();
+    }
+}
+
+// Insert at: channel ops, mutex, I/O, sleep...
+pub fn channelRecv(ch: *Channel, comptime T: type) ?T {
+    checkPreempt();  // ← manual insertion
+    // ... actual receive logic
+}
+```
+
+**Pros:** Simple, portable, safe
+**Cons:** Tight loops without checks run forever
+
+### 3. Run-to-Completion (Pony-style actors)
+
+```zig
+/// Actor processes messages then yields - no preemption
+pub fn runActor(actor: *Actor) void {
+    var batch: u32 = 0;
+
+    while (actor.mailbox.pop()) |msg| {
+        actor.dispatch(msg);  // runs to completion
+
+        batch += 1;
+        if (batch >= MAX_BATCH) break;  // batch limit only
+    }
+    // Natural yield point - no preemption needed
+}
+```
+
+**Pros:** Simplest, fastest (no checks)
+**Cons:** Bad behaviour = system hang
+
+---
+
+## Recommended: Hybrid Approach
+
+```zig
+pub fn sysmon(sched: *GlobalSched) void {
+    while (!sched.shutdown.load(.acquire)) {
+        std.time.sleep(SYSMON_INTERVAL);
+
+        for (sched.all_ps) |p| {
+            const g = p.current_g orelse continue;
+            const runtime = now() - g.start_time;
+
+            if (runtime > PREEMPT_THRESHOLD_NS) {
+                // Step 1: Set cooperative flag
+                g.preempt.store(true, .release);
+
+                // Step 2: If still running after grace period, force via signal
+                std.time.sleep(GRACE_PERIOD_NS);
+                if (p.current_g == g) {
+                    SignalPreemption.preemptM(p.m);
+                }
+            }
+        }
+    }
+}
+```
+
+---
+
+## M:N:P Scheduler in Zig: Feasibility Matrix
+
+| Component | Feasible | Implementation |
+|-----------|----------|----------------|
+| G (goroutine) | ✅ Yes | Struct with saved context |
+| M (OS thread) | ✅ Yes | `std.Thread` |
+| P (processor) | ✅ Yes | Struct with run queue |
+| Context switch | ✅ Yes | `ucontext` or inline asm |
+| Work stealing | ✅ Yes | Lock-free SPMC queue |
+| Global run queue | ✅ Yes | MPMC queue with lock |
+| Cooperative preemption | ✅ Yes | Flag checks at safe points |
+| Signal preemption | ✅ Yes | SIGURG handler |
+| Syscall handoff | ✅ Yes | Release P on enter, reacquire on exit |
+| Netpoller | ✅ Yes | epoll/kqueue integration |
+| **Reduction preemption** | ❌ No | Need compiler support |
+| **Hot reload** | ❌ No | Need interpreter/VM |
+
+---
+
+## Actor Model in Zig: Feasibility Matrix
+
+| Component | Feasible | Implementation |
+|-----------|----------|----------------|
+| Actor struct | ✅ Yes | Struct with mailbox + state |
+| Per-actor heap | ✅ Yes | `ArenaAllocator` per actor |
+| Per-actor GC | ✅ Yes | Free arena on actor death |
+| MPSC mailbox | ✅ Yes | Lock-free queue |
+| Work stealing (actors) | ✅ Yes | MPMC scheduler queue |
+| Run-to-completion | ✅ Yes | Natural, no preemption |
+| Batch limits | ✅ Yes | Counter in run loop |
+| Backpressure/muting | ✅ Yes | Track mailbox depth |
+| Supervisor trees | ✅ Yes | Pattern, not runtime magic |
+| Reference capabilities | ⚠️ Partial | Comptime checks, not as rich as Pony |
+| **Reduction preemption** | ❌ No | Need compiler |
+| **Hot reload** | ❌ No | Need VM |
+
+---
+
+## Acceptance Criteria: Zig Actor Runtime
+
+### AC-Z1: Actor Structure
+
+```zig
+pub const Actor = struct {
+    id: u64,
+    status: Status,
+
+    // Per-actor memory (no shared GC!)
+    heap: std.heap.ArenaAllocator,
+
+    // MPSC mailbox
+    mailbox: MPSCQueue(Message),
+
+    // Behaviour dispatch table
+    vtable: *const VTable,
+
+    // Backpressure
+    muted_senders: std.ArrayList(*Actor),
+    overloaded: bool = false,
+
+    pub const Status = enum {
+        idle,       // no messages, not scheduled
+        scheduled,  // on a scheduler queue
+        running,    // currently executing
+        blocked,    // waiting for something
+        dead,       // terminated
+    };
+
+    pub const VTable = struct {
+        dispatch: *const fn (*Actor, Message) void,
+        destroy: *const fn (*Actor) void,
+    };
+};
+```
+
+### AC-Z2: Message Structure
+
+```zig
+pub const Message = struct {
+    id: u32,                    // behaviour ID
+    sender: ?*Actor,            // for replies
+    next: ?*Message = null,     // intrusive list
+
+    // Payload follows in memory
+    pub fn payload(self: *Message, comptime T: type) *T {
+        const ptr = @as([*]u8, @ptrCast(self)) + @sizeOf(Message);
+        return @ptrCast(@alignCast(ptr));
+    }
+
+    pub fn create(allocator: Allocator, comptime T: type, id: u32, data: T) !*Message {
+        const mem = try allocator.alignedAlloc(u8, @alignOf(Message), @sizeOf(Message) + @sizeOf(T));
+        const msg: *Message = @ptrCast(mem.ptr);
+        msg.* = .{ .id = id, .sender = null };
+        msg.payload(T).* = data;
+        return msg;
+    }
+};
+```
+
+### AC-Z3: MPSC Queue (Lock-Free)
+
+```zig
+pub fn MPSCQueue(comptime T: type) type {
+    return struct {
+        head: Atomic(?*Node) = .{ .raw = null },
+        tail: *Atomic(?*Node),
+        stub: Node = .{ .value = undefined, .next = .{ .raw = null } },
+
+        const Node = struct {
+            value: T,
+            next: Atomic(?*Node),
+        };
+
+        const Self = @This();
+
+        pub fn init(self: *Self) void {
+            self.tail = &self.stub.next;
+            self.head.store(&self.stub, .seq_cst);
+        }
+
+        /// Multiple producers can call this concurrently
+        pub fn push(self: *Self, node: *Node) void {
+            node.next.store(null, .release);
+            const prev = self.head.swap(node, .acq_rel);
+            prev.next.store(node, .release);
+        }
+
+        /// Single consumer only
+        pub fn pop(self: *Self) ?T {
+            var tail = self.tail;
+            var next = tail.load(.acquire);
+
+            if (tail == &self.stub.next) {
+                if (next == null) return null;
+                self.tail = &next.?.next;
+                tail = &next.?.next;
+                next = tail.load(.acquire);
+            }
+
+            if (next) |n| {
+                self.tail = &n.next;
+                return tail.*.?.value;
+            }
+            return null;
+        }
+    };
+}
+```
+
+### AC-Z4: Scheduler (Work-Stealing)
+
+```zig
+pub const Scheduler = struct {
+    id: u32,
+    thread: std.Thread,
+
+    // Local queue of actors (MPMC for stealing)
+    local_queue: MPMCQueue(*Actor),
+
+    // Last steal victim (locality)
+    last_victim: ?*Scheduler = null,
+
+    // Park/wake mechanism
+    parked: Atomic(bool) = .{ .raw = false },
+    wake_signal: std.Thread.ResetEvent = .{},
+
+    pub fn run(self: *Scheduler) void {
+        while (!global.shutdown.load(.acquire)) {
+            const actor = self.getWork() orelse {
+                self.park();
+                continue;
+            };
+
+            self.runActor(actor);
+        }
+    }
+
+    fn getWork(self: *Scheduler) ?*Actor {
+        // 1. Try local queue
+        if (self.local_queue.pop()) |a| return a;
+
+        // 2. Try global inject queue
+        if (global.inject_queue.pop()) |a| return a;
+
+        // 3. Steal from others
+        return self.steal();
+    }
+
+    fn runActor(self: *Scheduler, actor: *Actor) void {
+        actor.status = .running;
+        defer actor.status = .idle;
+
+        var batch: u32 = 0;
+        while (actor.mailbox.pop()) |msg| {
+            actor.vtable.dispatch(actor, msg);
+
+            batch += 1;
+            if (batch >= MAX_BATCH) break;
+        }
+
+        // Reschedule if more messages
+        if (!actor.mailbox.isEmpty()) {
+            actor.status = .scheduled;
+            self.local_queue.push(actor);
+        }
+    }
+
+    fn steal(self: *Scheduler) ?*Actor {
+        const start = if (self.last_victim) |v| v.id else 0;
+
+        for (0..global.schedulers.len) |i| {
+            const idx = (start + i + 1) % global.schedulers.len;
+            if (idx == self.id) continue;
+
+            const victim = &global.schedulers[idx];
+            if (victim.local_queue.pop()) |actor| {
+                self.last_victim = victim;
+                return actor;
+            }
+        }
+        return null;
+    }
+};
+```
+
+### AC-Z5: Backpressure (Muting)
+
+```zig
+pub fn send(sender: *Actor, receiver: *Actor, msg: *Message) void {
+    msg.sender = sender;
+    receiver.mailbox.push(msg);
+
+    // Check overload
+    if (receiver.mailbox.len() > HIGH_WATERMARK) {
+        receiver.overloaded = true;
+    }
+
+    // Mute sender if receiver overloaded
+    if (receiver.overloaded) {
+        sender.status = .blocked;
+        receiver.muted_senders.append(sender) catch {};
+    }
+
+    // Schedule receiver
+    scheduleActor(receiver);
+}
+
+pub fn unmuteSenders(actor: *Actor) void {
+    if (actor.mailbox.len() < LOW_WATERMARK) {
+        actor.overloaded = false;
+
+        for (actor.muted_senders.items) |sender| {
+            sender.status = .scheduled;
+            scheduleActor(sender);
+        }
+        actor.muted_senders.clearRetainingCapacity();
+    }
+}
+```
+
+---
+
+## Trade-off Summary
+
+| What You Want | What You Need | Zig Can Do It? |
+|---------------|---------------|----------------|
+| Fair scheduling | Preemption | ⚠️ Cooperative + signals |
+| Memory isolation | Per-actor heap | ✅ Yes |
+| No global GC pause | Per-actor GC | ✅ Yes |
+| Infinite loop protection | Reduction counting | ❌ No (use batch limits) |
+| Live code updates | Hot reload | ❌ No |
+| Type-safe concurrency | Reference caps | ⚠️ Partial (comptime) |
+
+---
+
+## The Honest Answer
+
+**For M:N:P (Go-style):** Zig can build a production-quality scheduler. Signal preemption handles pathological cases. You won't have Go's compiler-inserted checks, but signals + cooperative yields cover 99% of cases.
+
+**For Actors (Pony/Erlang-style):** Zig can build a solid actor runtime. Run-to-completion is natural. Per-actor heaps are easy. You lose hot reload and reduction preemption, but Pony doesn't have those either and it works fine.
+
+**What you must accept:**
+1. Infinite loops in user code can hang the system (document this)
+2. No hot reload (restart to update)
+3. Preemption is best-effort, not guaranteed
+
+---
+
 ## References
 
 - [Go Scheduler Design Doc](https://docs.google.com/document/d/1TTj4T2JO42uD5ID9e89oa0sLKhJYD0Y_kqxDv3I3XMw/edit)
 - [Scalable Go Scheduler (2012)](https://docs.google.com/document/d/1TTj4T2JO42uD5ID9e89oa0sLKhJYD0Y_kqxDv3I3XMw)
 - [Go source: runtime](https://github.com/golang/go/tree/master/src/runtime)
 - [GopherCon 2018: The Scheduler Saga](https://www.youtube.com/watch?v=YHRO5WQGh0k)
+- [Pony Tutorial: Actors](https://tutorial.ponylang.io/types/actors)
+- [Pony Runtime Source](https://github.com/ponylang/ponyc/tree/main/src/libponyrt)
+- [Pony Reference Capabilities](https://tutorial.ponylang.io/reference-capabilities/)
+- [ORCA: GC for Actors (Pony's GC)](https://www.ponylang.io/media/papers/orca_gc_and_type_system_co-design_for_actor_languages.pdf)
