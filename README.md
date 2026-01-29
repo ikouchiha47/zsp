@@ -1,8 +1,16 @@
 # zsp
 
-csp in zig
+Playing with different async libraries and csp and actor in zig
 
-### tools
+## libs
+
+- libdill
+
+## references
+
+- [libdill]( https://sustrik.github.io/libdill/structured-concurrency.html)
+
+## debug tools
 
 - valgrind
 - gdb

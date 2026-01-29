@@ -63,3 +63,11 @@ fn fiber_func1(value: *u8) void {
     Fiber.done(); // Important
 }
 ```
+
+---
+
+## leveraging exsisting libraries
+
+- libdill, for simple coroutines
+- , for csp
+- , for actor modelling
